@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from app.core.strategy import VolumeSurgeStrategy, Signal
+from app.core.strategies import BaseStrategy, Signal
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ class BacktestEngine:
         self.initial_capital = initial_capital or settings.backtest_initial_capital
         self.commission = commission or settings.backtest_commission
 
-    async def run(self, strategy: VolumeSurgeStrategy, klines: list[dict],
+    async def run(self, strategy: BaseStrategy, klines: list[dict],
                   symbol: str = "BTCUSDT") -> BacktestResult:
         """运行回测.
 
@@ -116,7 +116,7 @@ class BacktestEngine:
 
     def _execute(self, capital: float, position: float, position_side: str,
                  entry_price: float, signal: Signal, kline: dict,
-                 idx: int, strategy: VolumeSurgeStrategy) -> tuple[float, float, str, float, dict | None]:
+                 idx: int, strategy: BaseStrategy) -> tuple[float, float, str, float, dict | None]:
         """执行单笔交易."""
         price = kline["close"]
         trade = None

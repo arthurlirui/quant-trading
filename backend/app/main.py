@@ -4,50 +4,65 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import select, text as sa_text
 
 from app.config import settings
 from app.db import create_tables, get_db, async_session_factory
-from app.models import Strategy, Kline, Trade, BacktestRun, Position
-from app.core.strategy import VolumeSurgeStrategy
+from app.models import Strategy as StrategyModel, Kline, Trade, BacktestRun, Position, Order
 from app.core.exchange import connector
 from app.core.backtest import BacktestEngine
+from app.core.strategies import (
+    BaseStrategy, Signal, MarketType,
+    create_strategy, get_strategy_meta,
+    VolumeSurgeStrategy, GridTradingStrategy,
+    MomentumBreakoutStrategy, MeanReversionStrategy,
+    MACDComboStrategy,
+)
+from app.core.trading import executor, risk_manager
 
 logger = logging.getLogger(__name__)
 
-# ── Active strategies ──
-_active_strategies: dict[str, VolumeSurgeStrategy] = {}  # symbol -> strategy
-_active_strategy_db_ids: dict[str, str] = {}  # symbol -> db_id
+# ── Global state ──
+_active_strategies: dict[str, BaseStrategy] = {}     # db_id -> strategy instance
+_active_symbol_map: dict[str, set[str]] = {}         # symbol -> set of db_ids
 _ws_clients: set[WebSocket] = set()
+
+# Track which symbols the connector is subscribed to
+_connector_symbols: set[str] = set()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Quant Trading System starting...")
+    logger.info("Quant Trading System v0.2.0 starting...")
     await create_tables()
+    await executor.start()
+    logger.info("System ready.")
     yield
     await connector.stop()
+    await executor.stop()
     for s in _active_strategies.values():
         s.reset()
     logger.info("System stopped.")
 
 
-app = FastAPI(title="Quant Trading API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Quant Trading API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=settings.cors_origins,
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
-# ── Binance market data handler ─────────────────────────────────
+# ── Market data handler ─────────────────────────────────────────
 
 async def on_kline(data: dict):
-    """Handle incoming kline from Binance — feed active strategies."""
     symbol = data["symbol"]
+    # Broadcast to WS clients
     msg = json.dumps({"type": "kline", "data": data})
     dead = set()
     for ws in _ws_clients:
@@ -57,25 +72,60 @@ async def on_kline(data: dict):
             dead.add(ws)
     _ws_clients -= dead
 
-    # Feed active strategies
-    if symbol in _active_strategies:
-        strategy = _active_strategies[symbol]
-        signal = strategy.on_kline(data)
-        if signal.action != "hold":
-            signal_msg = json.dumps({
-                "type": "signal", "data": {
-                    "symbol": symbol,
-                    "action": signal.action,
-                    "strength": signal.strength,
-                    "price": signal.price,
-                    "reason": signal.reason,
-                }
-            })
-            for ws in _ws_clients:
-                try:
-                    await ws.send_text(signal_msg)
-                except Exception:
-                    pass
+    # Feed all active strategies on this symbol
+    if symbol in _active_symbol_map:
+        for db_id in list(_active_symbol_map[symbol]):
+            strategy = _active_strategies.get(db_id)
+            if strategy:
+                signal = strategy.on_kline(data)
+                strategy.log_signal(signal, data)
+                # Broadcast non-hold signals
+                if signal.action != "hold":
+                    signal_msg = json.dumps({
+                        "type": "signal", "data": {
+                            "strategy_id": db_id,
+                            "strategy_name": strategy.name,
+                            "symbol": symbol,
+                            "action": signal.action,
+                            "strength": signal.strength,
+                            "price": signal.price,
+                            "reason": signal.reason,
+                            "sl_price": signal.sl_price,
+                            "tp_price": signal.tp_price,
+                        }
+                    })
+                    for ws in _ws_clients:
+                        try:
+                            await ws.send_text(signal_msg)
+                        except Exception:
+                            pass
+
+                    # Execute signal via trading executor
+                    if signal.action in ("buy", "sell", "close_long", "close_short"):
+                        pos = strategy.position
+                        mrkt = strategy._market_type
+                        lvg = strategy.params.get("futures_leverage", 1)
+                        result = await executor.execute_signal(
+                            signal_action=signal.action,
+                            symbol=symbol,
+                            price=signal.price,
+                            quantity_pct=signal.quantity_pct,
+                            market_type=mrkt,
+                            leverage=lvg,
+                            strategy_id=db_id,
+                        )
+                        if result.success and result.order:
+                            strategy.update_position(
+                                signal.action,
+                                result.order.avg_fill_price,
+                                data.get("open_time", 0),
+                                result.order.filled_quantity,
+                                pnl=result.order.pnl or 0.0,
+                            )
+                            risk_manager.record_trade_pnl(result.order.pnl or 0.0)
+                            _save_order_to_db(result.order)
+                            logger.info("[Exec] %s %s %s @ %.2f ✅",
+                                        symbol, signal.action, mrkt, signal.price)
 
 
 async def on_ticker(data: dict):
@@ -91,18 +141,272 @@ connector.on("kline", on_kline)
 connector.on("ticker", on_ticker)
 
 
+def _save_order_to_db(order):
+    """异步保存订单到数据库 (fire & forget)."""
+    async def _save():
+        try:
+            async with async_session_factory() as db:
+                db.add(Order(
+                    id=order.id,
+                    strategy_id=order.strategy_id,
+                    symbol=order.symbol,
+                    side=order.side,
+                    order_type=order.order_type,
+                    market_type=order.market_type,
+                    price=order.price,
+                    quantity=order.quantity,
+                    filled_quantity=order.filled_quantity,
+                    avg_fill_price=order.avg_fill_price,
+                    status=order.status,
+                    sl_price=order.sl_price,
+                    tp_price=order.tp_price,
+                    leverage=order.leverage,
+                    reduce_only=order.reduce_only,
+                    pnl=order.pnl if hasattr(order, 'pnl') else None,
+                    error=order.error,
+                    exchange_order_id=order.exchange_order_id,
+                ))
+                await db.commit()
+        except Exception as e:
+            logger.error("Save order error: %s", e)
+    asyncio.ensure_future(_save())
+
+
+# ── Helpers ──────────────────────────────────────────────────────
+
+async def _ensure_symbols(symbols: list[str]):
+    """确保连接器订阅了这些交易对."""
+    new = [s.upper() for s in symbols if s.upper() not in _connector_symbols]
+    if new:
+        await connector.start(new)
+        _connector_symbols.update(new)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# REST API
+# ═══════════════════════════════════════════════════════════════════
+
 # ── Status ──────────────────────────────────────────────────────
 
 @app.get("/api/v1/status")
-async def status():
+async def get_status():
     return {
+        "version": "0.2.0",
         "status": "running",
         "env": settings.app_env,
-        "symbols": ["BTCUSDT", "ETHUSDT"],
-        "active_strategies": list(_active_strategies.keys()),
-        "ws_clients": len(_ws_clients),
         "testnet": settings.binance_testnet,
+        "active_strategies": len(_active_strategies),
+        "ws_clients": len(_ws_clients),
+        "open_positions": len(executor.get_all_positions()),
     }
+
+
+# ── Strategy Types ──────────────────────────────────────────────
+
+@app.get("/api/v1/strategies/types")
+async def list_strategy_types():
+    """列出所有可用的策略类型及元数据."""
+    return list(get_strategy_meta().values())
+
+
+# ── Strategies ──────────────────────────────────────────────────
+
+@app.get("/api/v1/strategies")
+async def list_strategies():
+    """列出所有策略 (DB 中的)."""
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(StrategyModel).order_by(StrategyModel.updated_at.desc())
+        )
+        strategies = result.scalars().all()
+        enriched = []
+        for s in strategies:
+            d = {c.name: getattr(s, c.name) for c in s.__table__.columns}
+            d["running"] = s.id in _active_strategies
+            d["strategy_type"] = getattr(s, "strategy_type", "volume_surge")
+            if s.id in _active_strategies:
+                d["live_state"] = _active_strategies[s.id].to_dict()
+            enriched.append(d)
+        return enriched
+
+
+@app.post("/api/v1/strategies")
+async def create_strategy(data: dict):
+    """创建新策略 (支持选择策略类型)."""
+    strategy_type = data.get("strategy_type", "volume_surge")
+    market_type = data.get("market_type", "spot")
+    symbol = data.get("symbol", "BTCUSDT").upper()
+    params = data.get("params", {})
+
+    # Validate strategy type
+    meta = get_strategy_meta()
+    if strategy_type not in meta:
+        raise HTTPException(400, f"Unknown strategy type: {strategy_type}. Available: {list(meta.keys())}")
+    if market_type not in meta[strategy_type]["supported_markets"]:
+        raise HTTPException(400, f"Market '{market_type}' not supported by '{strategy_type}'")
+
+    async with async_session_factory() as db:
+        strategy = StrategyModel(
+            name=data.get("name", meta[strategy_type]["name"]),
+            symbol=symbol,
+            timeframe=data.get("timeframe", "1m"),
+            params=json.dumps(params),
+            status="stopped",
+        )
+        db.add(strategy)
+        await db.commit()
+        await db.refresh(strategy)
+
+    return {
+        "id": strategy.id,
+        "name": strategy.name,
+        "strategy_type": strategy_type,
+        "symbol": strategy.symbol,
+        "timeframe": strategy.timeframe,
+        "market_type": market_type,
+        "params": params,
+        "status": strategy.status,
+    }
+
+
+@app.get("/api/v1/strategies/{sid}")
+async def get_strategy(sid: str):
+    async with async_session_factory() as db:
+        result = await db.execute(select(StrategyModel).where(StrategyModel.id == sid))
+        s = result.scalar_one_or_none()
+        if not s:
+            raise HTTPException(404, "Strategy not found")
+        return s
+
+
+@app.put("/api/v1/strategies/{sid}")
+async def update_strategy(sid: str, data: dict):
+    async with async_session_factory() as db:
+        result = await db.execute(select(StrategyModel).where(StrategyModel.id == sid))
+        s = result.scalar_one_or_none()
+        if not s:
+            raise HTTPException(404, "Strategy not found")
+        for k, v in data.items():
+            if hasattr(s, k) and k not in ("id", "created_at"):
+                if k == "params" and isinstance(v, dict):
+                    v = json.dumps(v)
+                setattr(s, k, v)
+        await db.commit()
+        await db.refresh(s)
+        # Update running strategy params
+        if sid in _active_strategies and "params" in data:
+            _active_strategies[sid].update_params(
+                data["params"] if isinstance(data["params"], dict) else json.loads(data["params"])
+            )
+        return s
+
+
+@app.delete("/api/v1/strategies/{sid}")
+async def delete_strategy(sid: str):
+    async with async_session_factory() as db:
+        result = await db.execute(select(StrategyModel).where(StrategyModel.id == sid))
+        s = result.scalar_one_or_none()
+        if not s:
+            raise HTTPException(404, "Strategy not found")
+
+        # Stop if running
+        if sid in _active_strategies:
+            sym = s.symbol
+            _active_strategies.pop(sid, None)
+            if sym in _active_symbol_map:
+                _active_symbol_map[sym].discard(sid)
+
+        await db.delete(s)
+        await db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/v1/strategies/{sid}/start")
+async def start_strategy(sid: str, data: dict | None = None):
+    """启动策略.
+
+    Body (可选):
+        market_type: "spot" | "futures"
+    """
+    async with async_session_factory() as db:
+        result = await db.execute(select(StrategyModel).where(StrategyModel.id == sid))
+        s = result.scalar_one_or_none()
+        if not s:
+            raise HTTPException(404, "Strategy not found")
+
+    market_type = (data or {}).get("market_type", "spot")
+    strategy_type = getattr(s, "strategy_type", "volume_surge")
+
+    # Parse params from DB
+    params = {}
+    if s.params:
+        try:
+            params = json.loads(s.params) if isinstance(s.params, str) else s.params
+        except (json.JSONDecodeError, TypeError):
+            params = {}
+
+    # Create strategy instance
+    strategy = create_strategy(strategy_type, sid, params, market_type)
+    if not strategy:
+        raise HTTPException(400, f"Failed to create strategy of type '{strategy_type}'")
+
+    _active_strategies[sid] = strategy
+    if s.symbol not in _active_symbol_map:
+        _active_symbol_map[s.symbol] = set()
+    _active_symbol_map[s.symbol].add(sid)
+
+    # Ensure connector is subscribed
+    await _ensure_symbols([s.symbol])
+
+    s.status = "running"
+    async with async_session_factory() as db:
+        await db.merge(s)
+        await db.commit()
+
+    return {"ok": True, "symbol": s.symbol, "strategy_id": sid, "strategy_type": strategy_type, "market_type": market_type}
+
+
+@app.post("/api/v1/strategies/{sid}/stop")
+async def stop_strategy(sid: str):
+    async with async_session_factory() as db:
+        result = await db.execute(select(StrategyModel).where(StrategyModel.id == sid))
+        s = result.scalar_one_or_none()
+        if not s:
+            raise HTTPException(404, "Strategy not found")
+
+    if sid in _active_strategies:
+        _active_strategies.pop(sid, None)
+        if s.symbol in _active_symbol_map:
+            _active_symbol_map[s.symbol].discard(sid)
+
+    s.status = "stopped"
+    async with async_session_factory() as db:
+        await db.merge(s)
+        await db.commit()
+
+    return {"ok": True}
+
+
+# ── Strategy State (Real-time) ──────────────────────────────────
+
+@app.get("/api/v1/strategies/{sid}/state")
+async def get_strategy_state(sid: str):
+    """获取策略实时状态."""
+    strategy = _active_strategies.get(sid)
+    if not strategy:
+        raise HTTPException(404, "Strategy not running")
+
+    state = strategy.to_dict()
+    # Add executor positions for this strategy
+    positions = executor.get_all_positions()
+    if positions:
+        state["executor_positions"] = [
+            {"symbol": p.symbol, "side": p.side, "quantity": p.quantity,
+             "entry_price": p.entry_price, "unrealized_pnl": p.unrealized_pnl,
+             "realized_pnl": p.realized_pnl}
+            for p in positions
+        ]
+    return state
 
 
 # ── Market ──────────────────────────────────────────────────────
@@ -123,119 +427,227 @@ async def get_exchange_info():
     return await connector.get_exchange_info()
 
 
-# ── Strategies ──────────────────────────────────────────────────
+# ── Market Data Download ────────────────────────────────────────
 
-@app.get("/api/v1/strategies")
-async def list_strategies():
+@app.post("/api/v1/market/download")
+async def download_market_data(data: dict):
+    symbol = data.get("symbol", "BTCUSDT").upper()
+    interval = data.get("interval", "1m")
+    limit = min(int(data.get("limit", 500)), 1000)
+    start_time = data.get("start_time")
+    end_time = data.get("end_time")
+
+    klines = await connector.get_klines(symbol, interval, limit)
+    if not klines:
+        return {"error": "无法获取行情数据", "downloaded": 0}
+
+    if start_time:
+        klines = [k for k in klines if k["open_time"] >= start_time]
+    if end_time:
+        klines = [k for k in klines if k["open_time"] <= end_time]
+
+    saved = 0
+    skipped = 0
     async with async_session_factory() as db:
-        result = await db.execute(select(Strategy).order_by(Strategy.updated_at.desc()))
+        for k in klines:
+            try:
+                existing = await db.execute(
+                    select(Kline).where(
+                        Kline.symbol == symbol, Kline.interval == interval,
+                        Kline.open_time == k["open_time"],
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    skipped += 1
+                    continue
+                db.add(Kline(
+                    symbol=symbol, interval=interval,
+                    open_time=k["open_time"],
+                    open=k["open"], high=k["high"], low=k["low"],
+                    close=k["close"], volume=k["volume"],
+                    close_time=k.get("close_time", k["open_time"] + 60000),
+                ))
+                saved += 1
+            except Exception as e:
+                logger.warning("Skip kline: %s", e)
+                skipped += 1
+        await db.commit()
+
+    return {
+        "symbol": symbol, "interval": interval,
+        "downloaded": saved, "skipped": skipped,
+        "range": {
+            "from": klines[0]["open_time"], "to": klines[-1]["open_time"],
+            "count": len(klines),
+        } if klines else None,
+    }
+
+
+@app.get("/api/v1/market/data")
+async def query_market_data(
+    symbol: str = "BTCUSDT", interval: str = "1m",
+    limit: int = 200, offset: int = 0,
+    start_time: int | None = None, end_time: int | None = None,
+):
+    async with async_session_factory() as db:
+        query = select(Kline).where(
+            Kline.symbol == symbol.upper(), Kline.interval == interval,
+        ).order_by(Kline.open_time.desc())
+
+        if start_time:
+            query = query.where(Kline.open_time >= start_time)
+        if end_time:
+            query = query.where(Kline.open_time <= end_time)
+
+        total = await db.execute(
+            select(Kline.id).where(
+                Kline.symbol == symbol.upper(), Kline.interval == interval,
+            )
+        )
+        total_count = len(total.all())
+
+        result = await db.execute(query.offset(offset).limit(limit))
+        rows = result.scalars().all()
+
+        return {
+            "symbol": symbol.upper(), "interval": interval,
+            "total": total_count, "offset": offset, "limit": limit,
+            "data": [{
+                "open_time": r.open_time, "open": r.open, "high": r.high,
+                "low": r.low, "close": r.close, "volume": r.volume,
+                "close_time": r.close_time,
+            } for r in rows],
+        }
+
+
+@app.get("/api/v1/market/data/stats")
+async def market_data_stats():
+    async with async_session_factory() as db:
+        raw = await db.execute(sa_text("""
+            SELECT symbol, interval, COUNT(*) as count,
+                   MIN(open_time) as earliest, MAX(open_time) as latest
+            FROM klines GROUP BY symbol, interval ORDER BY symbol, interval
+        """))
+        return [{
+            "symbol": r[0], "interval": r[1], "count": r[2],
+            "earliest": r[3], "latest": r[4],
+        } for r in raw]
+
+
+# ── Orders ──────────────────────────────────────────────────────
+
+@app.post("/api/v1/orders")
+async def create_order(data: dict):
+    """手动创建订单."""
+    symbol = data.get("symbol", "BTCUSDT").upper()
+    side = data.get("side", "buy")
+    order_type = data.get("order_type", "market")
+    quantity = float(data.get("quantity", 0.01))
+    price = float(data.get("price", 0))
+    market_type = data.get("market_type", "spot")
+    leverage = int(data.get("leverage", 1))
+    strategy_id = data.get("strategy_id", "")
+
+    result = await executor.create_order(
+        symbol=symbol, side=side, order_type=order_type,
+        quantity=quantity, price=price,
+        market_type=market_type, leverage=leverage,
+        strategy_id=strategy_id,
+    )
+
+    if result.success and result.order:
+        _save_order_to_db(result.order)
+
+    return {
+        "success": result.success,
+        "order": result.order.__dict__ if result.order else None,
+        "error": result.error,
+    }
+
+
+@app.get("/api/v1/orders")
+async def list_orders(strategy_id: str | None = None):
+    """列出订单."""
+    return executor.get_orders(strategy_id)
+
+
+@app.delete("/api/v1/orders/{oid}")
+async def cancel_order(oid: str):
+    result = await executor.cancel_order(oid)
+    return {"success": result.success, "error": result.error}
+
+
+# ── Positions ──────────────────────────────────────────────────
+
+@app.get("/api/v1/positions")
+async def get_positions():
+    """获取当前持仓 (来自交易执行器)."""
+    positions = executor.get_all_positions()
+    return [{
+        "symbol": p.symbol, "side": p.side,
+        "quantity": p.quantity, "entry_price": p.entry_price,
+        "mark_price": p.mark_price,
+        "unrealized_pnl": p.unrealized_pnl,
+        "realized_pnl": p.realized_pnl,
+        "leverage": p.leverage,
+        "market_type": p.market_type,
+    } for p in positions]
+
+
+# ── Account ────────────────────────────────────────────────────
+
+@app.get("/api/v1/account")
+async def get_account(market_type: str = "spot"):
+    """获取账户信息."""
+    info = await executor.get_account(market_type)
+    return {
+        "total_equity": info.total_equity,
+        "wallet_balance": info.wallet_balance,
+        "available_balance": info.available_balance,
+        "unrealized_pnl": info.unrealized_pnl,
+        "margin_ratio": info.margin_ratio,
+        "can_trade": info.can_trade,
+        "market_type": info.market_type,
+        "positions_count": len(info.positions),
+    }
+
+
+# ── Risk ────────────────────────────────────────────────────────
+
+@app.get("/api/v1/risk")
+async def get_risk():
+    """获取风控状态."""
+    return risk_manager.to_dict()
+
+
+@app.put("/api/v1/risk/config")
+async def update_risk_config(data: dict):
+    """更新风控参数."""
+    for k, v in data.items():
+        if hasattr(risk_manager, k):
+            setattr(risk_manager, k, v)
+    return risk_manager.to_dict()
+
+
+# ── Trades (legacy) ─────────────────────────────────────────────
+
+@app.get("/api/v1/trades")
+async def list_trades():
+    async with async_session_factory() as db:
+        result = await db.execute(select(Trade).order_by(Trade.created_at.desc()).limit(100))
         return result.scalars().all()
 
 
-@app.post("/api/v1/strategies")
-async def create_strategy(data: dict):
-    async with async_session_factory() as db:
-        strategy = Strategy(
-            name=data.get("name", "Volume Surge"),
-            symbol=data.get("symbol", "BTCUSDT"),
-            timeframe=data.get("timeframe", "1m"),
-            params=json.dumps(data.get("params", {})),
-        )
-        db.add(strategy)
-        await db.commit()
-        await db.refresh(strategy)
-        return strategy
+# ── Backtest ────────────────────────────────────────────────────
 
-
-@app.get("/api/v1/strategies/{sid}")
-async def get_strategy(sid: str):
-    async with async_session_factory() as db:
-        result = await db.execute(select(Strategy).where(Strategy.id == sid))
-        s = result.scalar_one_or_none()
-        if not s:
-            raise HTTPException(404, "Strategy not found")
-        return s
-
-
-@app.put("/api/v1/strategies/{sid}")
-async def update_strategy(sid: str, data: dict):
-    async with async_session_factory() as db:
-        result = await db.execute(select(Strategy).where(Strategy.id == sid))
-        s = result.scalar_one_or_none()
-        if not s:
-            raise HTTPException(404, "Strategy not found")
-        for k, v in data.items():
-            if hasattr(s, k) and k not in ("id", "created_at"):
-                if k == "params" and isinstance(v, dict):
-                    v = json.dumps(v)
-                setattr(s, k, v)
-        await db.commit()
-        await db.refresh(s)
-        return s
-
-
-@app.delete("/api/v1/strategies/{sid}")
-async def delete_strategy(sid: str):
-    async with async_session_factory() as db:
-        result = await db.execute(select(Strategy).where(Strategy.id == sid))
-        s = result.scalar_one_or_none()
-        if not s:
-            raise HTTPException(404, "Strategy not found")
-        await db.delete(s)
-        await db.commit()
-    _active_strategies.pop(sid, None)
-    return {"ok": True}
-
-
-@app.post("/api/v1/strategies/{sid}/start")
-async def start_strategy(sid: str):
-    async with async_session_factory() as db:
-        result = await db.execute(select(Strategy).where(Strategy.id == sid))
-        s = result.scalar_one_or_none()
-        if not s:
-            raise HTTPException(404, "Strategy not found")
-
-    params = json.loads(s.params) if isinstance(s.params, str) else s.params
-    strategy = VolumeSurgeStrategy(params)
-    _active_strategies[s.symbol] = strategy
-
-    # Start Binance connector if not running
-    await connector.start([s.symbol])
-
-    s.status = "running"
-    async with async_session_factory() as db:
-        await db.merge(s)
-        await db.commit()
-
-    _active_strategy_db_ids[s.symbol] = sid
-
-    return {"ok": True, "symbol": s.symbol, "strategy_id": sid}
-
-
-@app.post("/api/v1/strategies/{sid}/stop")
-async def stop_strategy(sid: str):
-    async with async_session_factory() as db:
-        result = await db.execute(select(Strategy).where(Strategy.id == sid))
-        s = result.scalar_one_or_none()
-        if not s:
-            raise HTTPException(404, "Strategy not found")
-
-    _active_strategies.pop(s.symbol, None)
-    _active_strategy_db_ids.pop(s.symbol, None)
-    s.status = "stopped"
-    await db.merge(s)
-    await db.commit()
-
-    return {"ok": True}
-
-
-# ── Backtest ───────────────────────────────────────────────────
-
-backtest_results: dict[str, dict] = {}
+backtest_results_cache: dict[str, dict] = {}
 
 
 @app.post("/api/v1/backtest/run")
 async def run_backtest(data: dict):
+    """运行回测 (支持选择策略类型)."""
+    strategy_type = data.get("strategy_type", "volume_surge")
+    market_type = data.get("market_type", "spot")
     symbol = data.get("symbol", "BTCUSDT")
     params = data.get("params", {})
     lookback = int(data.get("lookback_hours", 24))
@@ -243,29 +655,27 @@ async def run_backtest(data: dict):
     # Fetch klines
     klines = await connector.get_klines(symbol, "1m", limit=lookback * 60)
     if len(klines) < 50:
-        # Use synthetic data if Binance unavailable
         klines = _generate_synthetic_klines(symbol, lookback * 60)
 
-    # Run backtest
-    strategy = VolumeSurgeStrategy(params)
+    # Create strategy for backtest
+    bt_strategy = create_strategy(strategy_type, "bt", params, market_type)
+    if not bt_strategy:
+        raise HTTPException(400, f"Unknown strategy type: {strategy_type}")
+
     engine = BacktestEngine(
         initial_capital=data.get("initial_capital", 10000),
         commission=data.get("commission", 0.001),
     )
-    result = await engine.run(strategy, klines, symbol)
+    result = await engine.run(bt_strategy, klines, symbol)
 
-    # Save
-    import uuid
     bt_id = str(uuid.uuid4())
-    backtest_results[bt_id] = {
-        "id": bt_id,
-        **{
-            k: v for k, v in result.__dict__.items()
-            if not k.startswith("_")
-        },
+    backtest_results_cache[bt_id] = {
+        "id": bt_id, "strategy_type": strategy_type,
+        "symbol": symbol, "market_type": market_type,
+        **{k: v for k, v in result.__dict__.items() if not k.startswith("_")},
     }
 
-    return {"id": bt_id, "summary": {
+    return {"id": bt_id, "strategy_type": strategy_type, "summary": {
         "total_return_pct": round(result.total_return_pct, 2),
         "sharpe": round(result.sharpe_ratio, 2),
         "max_drawdown": round(result.max_drawdown, 2),
@@ -277,14 +687,13 @@ async def run_backtest(data: dict):
 
 @app.get("/api/v1/backtest/{bid}")
 async def get_backtest(bid: str):
-    bt = backtest_results.get(bid)
+    bt = backtest_results_cache.get(bid)
     if not bt:
         raise HTTPException(404, "Backtest not found")
     return bt
 
 
 def _generate_synthetic_klines(symbol: str, n: int) -> list[dict]:
-    """生成模拟K线用于回测."""
     import random
     import time
     rng = random.Random(42)
@@ -294,7 +703,7 @@ def _generate_synthetic_klines(symbol: str, n: int) -> list[dict]:
     for i in range(n):
         change = rng.gauss(0, 0.002)
         vol_surge = 1.0
-        if rng.random() < 0.05:  # 5% 成交量突增
+        if rng.random() < 0.05:
             vol_surge = 3.0 + rng.random() * 5
             change += rng.gauss(0.005 if rng.random() > 0.5 else -0.005, 0.003)
         price *= (1 + change)
@@ -310,233 +719,6 @@ def _generate_synthetic_klines(symbol: str, n: int) -> list[dict]:
     return klines
 
 
-# ── Strategy State (Real-time) ──────────────────────────────────
-
-@app.get("/api/v1/strategies/{sid}/state")
-async def get_strategy_state(sid: str):
-    """获取策略实时状态：当前信号、持仓、参数等。"""
-    # Find the active strategy
-    strategy_obj = None
-    active_symbol = None
-    for sym, s in _active_strategies.items():
-        if _active_strategy_db_ids.get(sym) == sid:
-            strategy_obj = s
-            active_symbol = sym
-            break
-
-    if not strategy_obj:
-        raise HTTPException(404, "Strategy not running or not found")
-
-    pos = strategy_obj.position
-    recent_signals = strategy_obj.signal_log[-10:]
-
-    return {
-        "symbol": active_symbol,
-        "params": strategy_obj.params,
-        "position": {
-            "active": pos.active,
-            "side": pos.side,
-            "entry_price": pos.entry_price,
-            "quantity": pos.quantity,
-            "trades": pos.trades,
-            "win_trades": pos.win_trades,
-        },
-        "data_points": {
-            "prices": len(strategy_obj._prices),
-            "volumes": len(strategy_obj._volumes),
-        },
-        "recent_signals": recent_signals,
-    }
-
-
-# ── Market Data Download ──────────────────────────────────────────
-
-@app.post("/api/v1/market/download")
-async def download_market_data(data: dict):
-    """下载市场 K 线数据并保存到数据库。
-
-    Body:
-        symbol: str (默认 BTCUSDT)
-        interval: str (默认 1m)
-        limit: int (默认 500, 最大 1000)
-        start_time: int | None (毫秒时间戳)
-        end_time: int | None (毫秒时间戳)
-    """
-    symbol = data.get("symbol", "BTCUSDT").upper()
-    interval = data.get("interval", "1m")
-    limit = min(int(data.get("limit", 500)), 1000)
-    start_time = data.get("start_time")
-    end_time = data.get("end_time")
-
-    # Fetch klines from Binance
-    klines = await connector.get_klines(symbol, interval, limit)
-    if not klines:
-        return {"error": "无法获取行情数据", "downloaded": 0}
-
-    # Filter by time range if specified
-    if start_time:
-        klines = [k for k in klines if k["open_time"] >= start_time]
-    if end_time:
-        klines = [k for k in klines if k["open_time"] <= end_time]
-
-    # Save to database
-    saved = 0
-    skipped = 0
-    async with async_session_factory() as db:
-        for k in klines:
-            try:
-                # Upsert: check if kline already exists
-                existing = await db.execute(
-                    select(Kline).where(
-                        Kline.symbol == symbol,
-                        Kline.interval == interval,
-                        Kline.open_time == k["open_time"],
-                    )
-                )
-                if existing.scalar_one_or_none():
-                    skipped += 1
-                    continue
-
-                kline = Kline(
-                    symbol=symbol,
-                    interval=interval,
-                    open_time=k["open_time"],
-                    open=k["open"],
-                    high=k["high"],
-                    low=k["low"],
-                    close=k["close"],
-                    volume=k["volume"],
-                    close_time=k.get("close_time", k["open_time"] + 60000),
-                )
-                db.add(kline)
-                saved += 1
-            except Exception as e:
-                logger.warning("Skip kline: %s", e)
-                skipped += 1
-
-        await db.commit()
-
-    return {
-        "symbol": symbol,
-        "interval": interval,
-        "downloaded": saved,
-        "skipped": skipped,
-        "total_in_db": None,  # We could query count here
-        "range": {
-            "from": klines[0]["open_time"] if klines else None,
-            "to": klines[-1]["open_time"] if klines else None,
-            "count": len(klines),
-        } if klines else None,
-    }
-
-
-@app.get("/api/v1/market/data")
-async def query_market_data(
-    symbol: str = "BTCUSDT",
-    interval: str = "1m",
-    limit: int = 200,
-    offset: int = 0,
-    start_time: int | None = None,
-    end_time: int | None = None,
-):
-    """从数据库查询已保存的 K 线数据。"""
-    async with async_session_factory() as db:
-        query = select(Kline).where(
-            Kline.symbol == symbol.upper(),
-            Kline.interval == interval,
-        ).order_by(Kline.open_time.desc())
-
-        if start_time:
-            query = query.where(Kline.open_time >= start_time)
-        if end_time:
-            query = query.where(Kline.open_time <= end_time)
-
-        # Count total
-        count_q = select(Kline.id).where(
-            Kline.symbol == symbol.upper(),
-            Kline.interval == interval,
-        )
-        if start_time:
-            count_q = count_q.where(Kline.open_time >= start_time)
-        if end_time:
-            count_q = count_q.where(Kline.open_time <= end_time)
-
-        total = await db.execute(count_q)
-        total_count = len(total.all())
-
-        result = await db.execute(query.offset(offset).limit(limit))
-        rows = result.scalars().all()
-
-        return {
-            "symbol": symbol.upper(),
-            "interval": interval,
-            "total": total_count,
-            "offset": offset,
-            "limit": limit,
-            "data": [
-                {
-                    "open_time": r.open_time,
-                    "open": r.open,
-                    "high": r.high,
-                    "low": r.low,
-                    "close": r.close,
-                    "volume": r.volume,
-                    "close_time": r.close_time,
-                }
-                for r in rows
-            ],
-        }
-
-
-@app.get("/api/v1/market/data/stats")
-async def market_data_stats():
-    """查询数据库中的 K 线数据统计信息。"""
-    async with async_session_factory() as db:
-        result = await db.execute(
-            select(
-                Kline.symbol,
-                Kline.interval,
-                Kline.symbol,  # will use raw sql or group by
-            )
-        )
-        # Use raw SQL for group by
-        from sqlalchemy import text
-        stats_raw = await db.execute(text("""
-            SELECT symbol, interval, COUNT(*) as count,
-                   MIN(open_time) as earliest,
-                   MAX(open_time) as latest
-            FROM klines
-            GROUP BY symbol, interval
-            ORDER BY symbol, interval
-        """))
-        stats = []
-        for row in stats_raw:
-            stats.append({
-                "symbol": row[0],
-                "interval": row[1],
-                "count": row[2],
-                "earliest": row[3],
-                "latest": row[4],
-            })
-        return stats
-
-
-# ── Trades ──────────────────────────────────────────────────────
-
-@app.get("/api/v1/trades")
-async def list_trades():
-    async with async_session_factory() as db:
-        result = await db.execute(select(Trade).order_by(Trade.created_at.desc()).limit(100))
-        return result.scalars().all()
-
-
-@app.get("/api/v1/positions")
-async def get_positions():
-    async with async_session_factory() as db:
-        result = await db.execute(select(Position))
-        return result.scalars().all()
-
-
 # ── WebSocket ───────────────────────────────────────────────────
 
 @app.websocket("/api/v1/ws/market/{symbol}")
@@ -545,8 +727,24 @@ async def ws_market(ws: WebSocket, symbol: str):
     _ws_clients.add(ws)
     logger.info("[WS] Client connected for %s", symbol)
     try:
-        # Start connector if not running
-        await connector.start([symbol.upper()])
+        await _ensure_symbols([symbol.upper()])
+        while True:
+            msg = await ws.receive_text()
+            if msg == "ping":
+                await ws.send_text("pong")
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _ws_clients.discard(ws)
+
+
+@app.websocket("/api/v1/ws/signals")
+async def ws_signals(ws: WebSocket):
+    """WebSocket 推送所有交易信号."""
+    await ws.accept()
+    _ws_clients.add(ws)
+    logger.info("[WS] Signal client connected")
+    try:
         while True:
             msg = await ws.receive_text()
             if msg == "ping":
@@ -559,4 +757,4 @@ async def ws_market(ws: WebSocket, symbol: str):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "quant-trading"}
+    return {"status": "ok", "service": "quant-trading", "version": "0.2.0"}

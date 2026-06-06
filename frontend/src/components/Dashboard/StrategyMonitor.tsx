@@ -94,6 +94,9 @@ export default function StrategyMonitor() {
 
       {running.map(s => {
         const st = states[s.id];
+        const liveState = (s as any).live_state;
+        const marketTag = liveState?.market_type || 'spot';
+        const isFutures = marketTag === 'futures';
         return (
           <div key={s.id} className="rounded-lg bg-gray-900/50 border border-gray-800 overflow-hidden">
             {/* Header */}
@@ -102,6 +105,11 @@ export default function StrategyMonitor() {
                 <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
                 <span className="text-sm font-medium">{s.name}</span>
                 <span className="text-[10px] text-gray-500">{s.symbol}</span>
+                <span className={`text-[9px] px-1 py-0.5 rounded ${
+                  isFutures ? 'bg-yellow-500/20 text-yellow-400' : 'bg-blue-500/20 text-blue-400'
+                }`}>
+                  {marketTag}
+                </span>
               </div>
               <button
                 onClick={() => stopStrategy(s.id)}

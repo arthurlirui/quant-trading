@@ -106,3 +106,64 @@ export interface MarketDataStat {
 }
 
 export type ViewMode = 'trading' | 'dashboard';
+
+// ── New types for v0.2.0 ──
+
+export type MarketType = 'spot' | 'futures';
+
+export interface StrategyMeta {
+  id: string;
+  name: string;
+  description: string;
+  supported_markets: MarketType[];
+  default_params: Record<string, number>;
+}
+
+export interface CreateStrategyRequest {
+  strategy_type: string;
+  market_type: MarketType;
+  symbol: string;
+  timeframe?: string;
+  name?: string;
+  params?: Record<string, number>;
+}
+
+export interface Order {
+  id: string;
+  strategy_id: string;
+  symbol: string;
+  side: string;
+  order_type: string;
+  market_type: MarketType;
+  price: number;
+  quantity: number;
+  filled_quantity: number;
+  avg_fill_price: number;
+  status: string;
+  stop_price: number | null;
+  sl_price: number | null;
+  tp_price: number | null;
+  leverage: number;
+  pnl: number | null;
+  created_at: number;
+  error: string;
+}
+
+export interface PositionInfo {
+  symbol: string;
+  side: 'long' | 'short';
+  quantity: number;
+  entry_price: number;
+  mark_price: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  leverage: number;
+  market_type: MarketType;
+}
+
+export interface RiskSummary {
+  equity: { current: number; peak: number; drawdown_pct: number };
+  daily: { pnl: number; loss: number; trades: number };
+  limits: { max_positions: number; max_position_value: number; max_leverage: number };
+  can_trade: boolean;
+}
