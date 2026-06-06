@@ -45,4 +45,64 @@ export interface Strategy {
   params: string;
   status: string;
   enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
 }
+
+export interface StrategyState {
+  symbol: string;
+  params: Record<string, number>;
+  position: {
+    active: boolean;
+    side: string;
+    entry_price: number;
+    quantity: number;
+    trades: number;
+    win_trades: number;
+  };
+  data_points: {
+    prices: number;
+    volumes: number;
+  };
+  recent_signals: SignalData[];
+}
+
+export interface SignalData {
+  time: number;
+  price: number;
+  volume: number;
+  action: string;
+  strength: number;
+  reason: string;
+}
+
+export interface MarketDownloadResult {
+  symbol: string;
+  interval: string;
+  downloaded: number;
+  skipped: number;
+  range: {
+    from: number;
+    to: number;
+    count: number;
+  } | null;
+}
+
+export interface MarketDataQuery {
+  symbol: string;
+  interval: string;
+  total: number;
+  offset: number;
+  limit: number;
+  data: Kline[];
+}
+
+export interface MarketDataStat {
+  symbol: string;
+  interval: string;
+  count: number;
+  earliest: number;
+  latest: number;
+}
+
+export type ViewMode = 'trading' | 'dashboard';
