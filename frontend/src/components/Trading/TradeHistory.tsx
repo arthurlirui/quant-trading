@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { History, TrendingUp, TrendingDown, ChevronDown, RefreshCw } from 'lucide-react';
 import type { Strategy } from '../../types';
+import { useSWR } from '../../lib/hooks/useSWR';
 
 export interface TradeRecord {
   id: string;
@@ -19,11 +20,8 @@ export interface TradeRecord {
 }
 
 interface Props {
-  /** 选中的策略 id, 'all' = 不过滤 */
   defaultStrategyId?: string;
-  /** 选中的模式 */
   defaultMode?: 'all' | 'sim' | 'live';
-  /** 拉到 trades 后回调（用于联动 chart markers） */
   onTradesLoaded?: (trades: TradeRecord[]) => void;
   symbolFilter?: string;
 }
@@ -34,38 +32,27 @@ export default function TradeHistory({
   onTradesLoaded,
   symbolFilter,
 }: Props) {
-  const [strategies, setStrategies] = useState<Strategy[]>([]);
-  const [trades, setTrades] = useState<TradeRecord[]>([]);
   const [strategyId, setStrategyId] = useState(defaultStrategyId);
   const [mode, setMode] = useState<'all' | 'sim' | 'live'>(defaultMode);
-  const [loading, setLoading] = useState(false);
 
-  useEffect(() => {
-    fetch('/api/v1/strategies').then(r => r.json()).then(setStrategies).catch(() => {});
-  }, []);
+  const { data: strategies = [] } = useSWR<Strategy[]>('/api/v1/strategies');
 
-  const fetchTrades = async () => {
-    setLoading(true);
-    try {
-      const params = new URLSearchParams();
-      if (strategyId !== 'all') params.set('strategy_id', strategyId);
-      if (mode !== 'all') params.set('mode', mode);
-      if (symbolFilter) params.set('symbol', symbolFilter);
-      params.set('limit', '100');
-      const res = await fetch(`/api/v1/trades?${params}`);
-      const data: TradeRecord[] = await res.json();
-      setTrades(data);
-      onTradesLoaded?.(data);
-    } catch { /* */ }
-    setLoading(false);
-  };
-
-  useEffect(() => {
-    fetchTrades();
-    const id = setInterval(fetchTrades, 5000);
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const tradesKey = useMemo(() => {
+    const p = new URLSearchParams();
+    if (strategyId !== 'all') p.set('strategy_id', strategyId);
+    if (mode !== 'all') p.set('mode', mode);
+    if (symbolFilter) p.set('symbol', symbolFilter);
+    p.set('limit', '100');
+    return `/api/v1/trades?${p}`;
   }, [strategyId, mode, symbolFilter]);
+
+  const { data: trades = [], fetching, refresh } = useSWR<TradeRecord[]>(tradesKey);
+
+  // notify parent
+  useEffect(() => {
+    if (trades) onTradesLoaded?.(trades);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trades]);
 
   return (
     <div className="bg-gray-900/50 border border-gray-800 rounded">
@@ -75,7 +62,6 @@ export default function TradeHistory({
           <span className="text-[10px] text-gray-500">({trades.length})</span>
         </h3>
         <div className="flex items-center gap-1.5">
-          {/* 策略下拉 */}
           <div className="relative">
             <select
               value={strategyId}
@@ -89,7 +75,6 @@ export default function TradeHistory({
             </select>
             <ChevronDown className="absolute right-1 top-1/2 -translate-y-1/2 h-3 w-3 text-gray-500 pointer-events-none" />
           </div>
-          {/* mode 下拉 */}
           <div className="relative">
             <select
               value={mode}
@@ -103,12 +88,12 @@ export default function TradeHistory({
             <ChevronDown className="absolute right-1 top-1/2 -translate-y-1/2 h-3 w-3 text-gray-500 pointer-events-none" />
           </div>
           <button
-            onClick={fetchTrades}
-            disabled={loading}
+            onClick={() => refresh()}
+            disabled={fetching}
             className="p-1 hover:bg-gray-800 rounded transition"
             title="刷新"
           >
-            <RefreshCw className={`h-3 w-3 text-gray-500 ${loading ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`h-3 w-3 text-gray-500 ${fetching ? 'animate-spin' : ''}`} />
           </button>
         </div>
       </div>

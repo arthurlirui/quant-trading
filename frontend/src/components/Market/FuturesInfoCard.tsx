@@ -1,26 +1,15 @@
-import { useEffect, useState } from 'react';
 import { TrendingUp, TrendingDown, Activity, DollarSign, Layers } from 'lucide-react';
-import { api, type MarketSummary } from '../../lib/api';
+import type { MarketSummary } from '../../lib/api';
+import { useSWR } from '../../lib/hooks/useSWR';
 
 interface Props {
   symbol: string;
 }
 
 export default function FuturesInfoCard({ symbol }: Props) {
-  const [data, setData] = useState<MarketSummary | null>(null);
+  const { data, loading } = useSWR<MarketSummary>(`/api/v1/market/summary/${symbol}`);
 
-  useEffect(() => {
-    let alive = true;
-    const fetchOnce = async () => {
-      const d = await api.getMarketSummary(symbol);
-      if (alive) setData(d);
-    };
-    fetchOnce();
-    const id = setInterval(fetchOnce, 5000);
-    return () => { alive = false; clearInterval(id); };
-  }, [symbol]);
-
-  if (!data) {
+  if (loading || !data) {
     return (
       <div className="bg-gray-900/50 border border-gray-800 rounded p-3 text-xs text-gray-500">
         加载合约数据中…
@@ -59,21 +48,16 @@ export default function FuturesInfoCard({ symbol }: Props) {
       </div>
 
       <div className="p-3 space-y-2.5 text-xs">
-        {/* Mark Price */}
         <Row label={<><DollarSign className="h-3 w-3 inline" /> 标记价</>}>
           <span className="font-mono font-semibold text-white">
             {mark ? `$${mark.mark_price.toFixed(2)}` : '–'}
           </span>
         </Row>
-
-        {/* Index Price */}
         <Row label="指数价">
           <span className="font-mono text-gray-300">
             {mark ? `$${mark.index_price.toFixed(2)}` : '–'}
           </span>
         </Row>
-
-        {/* Basis */}
         {basis && (
           <Row label="基差 (vs 现货)">
             <span className={`font-mono ${basis.diff >= 0 ? 'text-green-400' : 'text-red-400'}`}>
@@ -84,28 +68,22 @@ export default function FuturesInfoCard({ symbol }: Props) {
 
         <div className="border-t border-gray-800 my-2" />
 
-        {/* Funding Rate */}
         <Row label={<><Activity className="h-3 w-3 inline" /> 资金费率</>}>
           <span className={`font-mono font-semibold ${fundingClass}`}>
             {mark && mark.funding_rate >= 0 ? '+' : ''}{fundingPct}%
           </span>
         </Row>
-
-        {/* Next Funding */}
         <Row label="下次结算">
           <span className="text-gray-300 text-[10px]">{nextFunding}</span>
         </Row>
 
         <div className="border-t border-gray-800 my-2" />
 
-        {/* Open Interest */}
         <Row label="未平仓位 (BTC)">
           <span className="font-mono text-gray-300">
             {oi ? oi.open_interest.toLocaleString(undefined, { maximumFractionDigits: 2 }) : '–'}
           </span>
         </Row>
-
-        {/* 24h Volume */}
         {fut && (
           <Row label="24h 成交量">
             <span className="font-mono text-gray-300">
@@ -113,7 +91,6 @@ export default function FuturesInfoCard({ symbol }: Props) {
             </span>
           </Row>
         )}
-
         {fut?.quote_volume && (
           <Row label="24h 成交额 (USDT)">
             <span className="font-mono text-gray-300">
@@ -124,7 +101,6 @@ export default function FuturesInfoCard({ symbol }: Props) {
 
         <div className="border-t border-gray-800 my-2" />
 
-        {/* 24h Stats */}
         {fut && (
           <>
             <Row label="24h 最高 / 最低">

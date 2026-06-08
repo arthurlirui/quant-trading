@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { TrendingUp, TrendingDown } from 'lucide-react';
 import type { Ticker, MarketType } from '../../types';
-import { api } from '../../lib/api';
+import { useSWR } from '../../lib/hooks/useSWR';
 
 interface Props {
   market: MarketType;
@@ -10,29 +10,44 @@ interface Props {
 
 const DEFAULT_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'];
 
-export default function TickerBar({ market, symbols = DEFAULT_SYMBOLS }: Props) {
-  const [tickers, setTickers] = useState<Record<string, Ticker>>({});
+/** 单 symbol ticker — 让每个 ticker 走独立 useSWR，更好的缓存复用 */
+function useTickers(market: MarketType, symbols: string[]): Record<string, Ticker> {
+  const [results, setResults] = useState<Record<string, Ticker>>({});
+
+  // 用一个聚合 key 触发统一节奏拉取，但实际请求并行
+  const aggKey = `tickers:${market}:${symbols.join(',')}`;
+  const { lastUpdated } = useSWR<Record<string, Ticker>>(
+    aggKey,
+    {
+      parser: async () => {
+        const res = await Promise.allSettled(
+          symbols.map(async sym => {
+            const r = await fetch(`/api/v1/market/ticker/${sym}?market=${market}`);
+            const d = await r.json();
+            return d.error ? null : { sym, t: d as Ticker };
+          }),
+        );
+        const next: Record<string, Ticker> = {};
+        for (const r of res) {
+          if (r.status === 'fulfilled' && r.value) next[r.value.sym] = r.value.t;
+        }
+        setResults(next);
+        return next;
+      },
+      silent: true,
+    },
+  );
 
   useEffect(() => {
-    setTickers({});  // clear when market changes
-    let alive = true;
-
-    const tick = async () => {
-      const results = await Promise.allSettled(
-        symbols.map(sym => api.getTicker(sym, market).then(t => ({ sym, t }))),
-      );
-      if (!alive) return;
-      const next: Record<string, Ticker> = {};
-      for (const r of results) {
-        if (r.status === 'fulfilled' && r.value.t) next[r.value.sym] = r.value.t;
-      }
-      setTickers(next);
-    };
-
-    tick();
-    const id = setInterval(tick, 4000);
-    return () => { alive = false; clearInterval(id); };
+    setResults({});  // clear on market change
   }, [market, symbols.join(',')]);
+
+  void lastUpdated;
+  return results;
+}
+
+export default function TickerBar({ market, symbols = DEFAULT_SYMBOLS }: Props) {
+  const tickers = useTickers(market, symbols);
 
   return (
     <div className="flex items-center gap-4 px-4 py-1.5 bg-gray-900/80 border-b border-gray-800 text-xs overflow-x-auto">
