@@ -1,49 +1,12 @@
-import { useEffect, useState, useRef } from 'react';
-import { Cpu, TrendingUp, TrendingDown, Activity, Zap, RefreshCw } from 'lucide-react';
+import { useState } from 'react';
+import { Cpu, Activity, Zap, RefreshCw } from 'lucide-react';
 import type { Strategy, StrategyState, SignalData } from '../../types';
+import { useStrategies } from '../../lib/hooks/useStrategies';
 
 export default function StrategyMonitor() {
-  const [strategies, setStrategies] = useState<Strategy[]>([]);
-  const [states, setStates] = useState<Record<string, StrategyState>>({});
+  const { strategies, states: rawStates, refresh: fetchStrategies } = useStrategies();
+  const states = rawStates as Record<string, StrategyState>;
   const [loading, setLoading] = useState(false);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  useEffect(() => {
-    fetchStrategies();
-    // Poll every 3s
-    intervalRef.current = setInterval(fetchStrategies, 3000);
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, []);
-
-  const fetchStrategies = async () => {
-    try {
-      const res = await fetch('/api/v1/strategies');
-      const list: Strategy[] = await res.json();
-      setStrategies(list);
-
-      // Fetch state for running strategies
-      for (const s of list) {
-        if (s.status === 'running') {
-          try {
-            const stateRes = await fetch(`/api/v1/strategies/${s.id}/state`);
-            if (stateRes.ok) {
-              const state: StrategyState = await stateRes.json();
-              setStates(prev => ({ ...prev, [s.id]: state }));
-            }
-          } catch { /* */ }
-        } else {
-          // Remove stale state
-          setStates(prev => {
-            const next = { ...prev };
-            delete next[s.id];
-            return next;
-          });
-        }
-      }
-    } catch { /* */ }
-  };
 
   const startStrategy = async (id: string) => {
     setLoading(true);
