@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
@@ -21,7 +22,7 @@ from app.core.exchange import connector
 from app.core.backtest import BacktestEngine
 from app.core.strategies import (
     BaseStrategy, Signal, MarketType,
-    create_strategy, get_strategy_meta,
+    create_strategy as factory_create_strategy, get_strategy_meta,
     VolumeSurgeStrategy, GridTradingStrategy,
     MomentumBreakoutStrategy, MeanReversionStrategy,
     MACDComboStrategy,
@@ -44,6 +45,9 @@ async def lifespan(app: FastAPI):
     logger.info("Quant Trading System v0.2.0 starting...")
     await create_tables()
     await executor.start()
+    # 启动行情 connector 默认订阅, REST sessions 始终可用
+    await connector.start([settings.default_symbol])
+    _connector_symbols.add(settings.default_symbol.upper())
     logger.info("System ready.")
     yield
     await connector.stop()
@@ -70,7 +74,7 @@ async def on_kline(data: dict):
             await ws.send_text(msg)
         except Exception:
             dead.add(ws)
-    _ws_clients -= dead
+    _ws_clients.difference_update(dead)
 
     # Feed all active strategies on this symbol
     if symbol in _active_symbol_map:
@@ -124,6 +128,19 @@ async def on_kline(data: dict):
                             )
                             risk_manager.record_trade_pnl(result.order.pnl or 0.0)
                             _save_order_to_db(result.order)
+                            # 同步落库 Trade 表 (交易明细)
+                            mode = "sim" if settings.binance_testnet else "live"
+                            _save_trade_to_db(
+                                strategy_id=db_id,
+                                symbol=symbol,
+                                side=result.order.side,
+                                price=result.order.avg_fill_price,
+                                quantity=result.order.filled_quantity,
+                                pnl=result.order.pnl,
+                                signal_strength=getattr(signal, "strength", None),
+                                action=signal.action,
+                                mode=mode,
+                            )
                             logger.info("[Exec] %s %s %s @ %.2f ✅",
                                         symbol, signal.action, mrkt, signal.price)
 
@@ -169,6 +186,41 @@ def _save_order_to_db(order):
                 await db.commit()
         except Exception as e:
             logger.error("Save order error: %s", e)
+    asyncio.ensure_future(_save())
+
+
+def _save_trade_to_db(*, strategy_id: str, symbol: str, side: str, price: float,
+                        quantity: float, pnl: float | None,
+                        signal_strength: float | None,
+                        action: str, mode: str = "live"):
+    """保存 Trade 记录 (fire & forget). action=buy|sell|close_long|close_short."""
+    # side normalized: "buy" / "sell" 不动; close_long/short 映射到 sell/buy
+    db_side = side
+    is_close = action in ("close_long", "close_short")
+    if action == "close_long":
+        db_side = "sell"
+    elif action == "close_short":
+        db_side = "buy"
+    status = "closed" if is_close else "open"
+
+    async def _save():
+        try:
+            async with async_session_factory() as db:
+                db.add(Trade(
+                    strategy_id=strategy_id,
+                    symbol=symbol,
+                    side=db_side,
+                    price=price,
+                    quantity=quantity,
+                    pnl=pnl,
+                    status=status,
+                    signal_strength=signal_strength,
+                    backtest_id=f"mode:{mode}",  # 没有专门字段, 复用 backtest_id 存 mode
+                    close_time=datetime.now(timezone.utc) if is_close else None,
+                ))
+                await db.commit()
+        except Exception as e:
+            logger.error("Save trade error: %s", e)
     asyncio.ensure_future(_save())
 
 
@@ -346,7 +398,7 @@ async def start_strategy(sid: str, data: dict | None = None):
             params = {}
 
     # Create strategy instance
-    strategy = create_strategy(strategy_type, sid, params, market_type)
+    strategy = factory_create_strategy(strategy_type, sid, params, market_type)
     if not strategy:
         raise HTTPException(400, f"Failed to create strategy of type '{strategy_type}'")
 
@@ -412,19 +464,72 @@ async def get_strategy_state(sid: str):
 # ── Market ──────────────────────────────────────────────────────
 
 @app.get("/api/v1/market/ticker/{symbol}")
-async def get_ticker(symbol: str):
-    data = await connector.get_ticker(symbol.upper())
+async def get_ticker(symbol: str, market: str = Query("spot", regex="^(spot|futures)$")):
+    data = await connector.get_ticker(symbol.upper(), market=market)
     return data or {"error": "not found"}
 
 
 @app.get("/api/v1/market/klines/{symbol}")
-async def get_klines(symbol: str, interval: str = "1m", limit: int = 100):
-    return await connector.get_klines(symbol.upper(), interval, limit)
+async def get_klines(symbol: str, interval: str = "1m", limit: int = 100,
+                      market: str = Query("spot", regex="^(spot|futures)$")):
+    return await connector.get_klines(symbol.upper(), interval, limit, market=market)
 
 
 @app.get("/api/v1/market/info")
-async def get_exchange_info():
-    return await connector.get_exchange_info()
+async def get_exchange_info(market: str = Query("spot", regex="^(spot|futures)$")):
+    return await connector.get_exchange_info(market=market)
+
+
+# ── Futures-only endpoints ──────────────────────────────────────
+
+@app.get("/api/v1/market/futures/mark-price/{symbol}")
+async def get_mark_price(symbol: str):
+    """获取合约标记价格 + 资金费率."""
+    data = await connector.get_mark_price(symbol.upper())
+    return data or {"error": "not found"}
+
+
+@app.get("/api/v1/market/futures/open-interest/{symbol}")
+async def get_open_interest(symbol: str):
+    """获取合约未平仓位."""
+    data = await connector.get_open_interest(symbol.upper())
+    return data or {"error": "not found"}
+
+
+@app.get("/api/v1/market/futures/depth/{symbol}")
+async def get_futures_depth(symbol: str, limit: int = 10):
+    """获取合约盘口."""
+    data = await connector.get_futures_order_book(symbol.upper(), limit)
+    return data or {"error": "not found"}
+
+
+@app.get("/api/v1/market/futures/funding-rates")
+async def get_funding_rates(symbol: str = "", limit: int = 100):
+    """获取历史资金费率."""
+    return await connector.get_funding_rates(symbol.upper() if symbol else "", limit)
+
+
+@app.get("/api/v1/market/summary/{symbol}")
+async def get_market_summary(symbol: str):
+    """合并某个交易对的现货 + 合约概览 (一次拉取)."""
+    sym = symbol.upper()
+    import asyncio
+    spot_ticker, futures_ticker, mark, oi = await asyncio.gather(
+        connector.get_ticker(sym, market="spot"),
+        connector.get_ticker(sym, market="futures"),
+        connector.get_mark_price(sym),
+        connector.get_open_interest(sym),
+        return_exceptions=True,
+    )
+    def safe(x):
+        return x if not isinstance(x, BaseException) and x else None
+    return {
+        "symbol": sym,
+        "spot": safe(spot_ticker),
+        "futures": safe(futures_ticker),
+        "futures_mark": safe(mark),
+        "futures_open_interest": safe(oi),
+    }
 
 
 # ── Market Data Download ────────────────────────────────────────
@@ -632,10 +737,42 @@ async def update_risk_config(data: dict):
 # ── Trades (legacy) ─────────────────────────────────────────────
 
 @app.get("/api/v1/trades")
-async def list_trades():
+async def list_trades(
+    strategy_id: str | None = None,
+    symbol: str | None = None,
+    mode: str | None = Query(None, regex="^(sim|live)$"),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """列出交易记录, 可按 strategy_id / symbol / mode 过滤."""
     async with async_session_factory() as db:
-        result = await db.execute(select(Trade).order_by(Trade.created_at.desc()).limit(100))
-        return result.scalars().all()
+        q = select(Trade).order_by(Trade.created_at.desc())
+        if strategy_id:
+            q = q.where(Trade.strategy_id == strategy_id)
+        if symbol:
+            q = q.where(Trade.symbol == symbol.upper())
+        if mode:
+            q = q.where(Trade.backtest_id == f"mode:{mode}")
+        q = q.limit(limit)
+        result = await db.execute(q)
+        rows = result.scalars().all()
+        return [
+            {
+                "id": t.id,
+                "strategy_id": t.strategy_id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "price": t.price,
+                "quantity": t.quantity,
+                "pnl": t.pnl,
+                "status": t.status,
+                "signal_strength": t.signal_strength,
+                "mode": (t.backtest_id or "").replace("mode:", "") if t.backtest_id and t.backtest_id.startswith("mode:") else None,
+                "open_time": t.open_time.isoformat() if t.open_time else None,
+                "close_time": t.close_time.isoformat() if t.close_time else None,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in rows
+        ]
 
 
 # ── Backtest ────────────────────────────────────────────────────
@@ -658,7 +795,7 @@ async def run_backtest(data: dict):
         klines = _generate_synthetic_klines(symbol, lookback * 60)
 
     # Create strategy for backtest
-    bt_strategy = create_strategy(strategy_type, "bt", params, market_type)
+    bt_strategy = factory_create_strategy(strategy_type, "bt", params, market_type)
     if not bt_strategy:
         raise HTTPException(400, f"Unknown strategy type: {strategy_type}")
 
