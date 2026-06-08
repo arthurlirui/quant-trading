@@ -105,7 +105,7 @@ export interface MarketDataStat {
   latest: number;
 }
 
-export type ViewMode = 'trading' | 'dashboard';
+export type ViewMode = 'trading' | 'dashboard' | 'market';
 
 // ── New types for v0.2.0 ──
 

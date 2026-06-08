@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
-import { Play, Square, Settings, BarChart3, Cpu, Plus, Layers, Globe } from 'lucide-react';
+import { Play, Square, Settings, BarChart3, Cpu, Plus, Layers, Globe, Loader2 } from 'lucide-react';
+import StrategyParamsEditor from './StrategyParamsEditor';
 import type { Strategy, BacktestSummary, StrategyMeta, MarketType } from '../../types';
 
 const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'];
@@ -12,6 +13,8 @@ export default function StrategyPanel() {
   const [showCreate, setShowCreate] = useState(false);
   const [strategyTypes, setStrategyTypes] = useState<StrategyMeta[]>([]);
   const [positions, setPositions] = useState<any[]>([]);
+  const [loadingOps, setLoadingOps] = useState<Set<string>>(new Set());  // strategy_id
+  const [toast, setToast] = useState<{msg: string; ok: boolean} | null>(null);
 
   // Create form state
   const [newStrategy, setNewStrategy] = useState({
@@ -66,17 +69,36 @@ export default function StrategyPanel() {
   };
 
   const startStrategy = async (id: string, marketType?: string) => {
-    await fetch(`/api/v1/strategies/${id}/start`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ market_type: marketType || 'spot' }),
-    });
-    await fetchStrategies();
+    setLoadingOps(prev => new Set(prev).add(id));
+    try {
+      const res = await fetch(`/api/v1/strategies/${id}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ market_type: marketType || 'spot' }),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        setToast({ msg: `启动失败: ${err.slice(0, 60)}`, ok: false });
+      }
+      await fetchStrategies();
+    } catch {
+      setToast({ msg: '启动失败: 网络错误', ok: false });
+    } finally {
+      setLoadingOps(prev => { const n = new Set(prev); n.delete(id); return n; });
+    }
   };
 
   const stopStrategy = async (id: string) => {
-    await fetch(`/api/v1/strategies/${id}/stop`, { method: 'POST' });
-    await fetchStrategies();
+    setLoadingOps(prev => new Set(prev).add(id));
+    try {
+      await fetch(`/api/v1/strategies/${id}/stop`, { method: 'POST' });
+      setToast({ msg: '策略已停止', ok: true });
+      await fetchStrategies();
+    } catch {
+      setToast({ msg: '停止失败', ok: false });
+    } finally {
+      setLoadingOps(prev => { const n = new Set(prev); n.delete(id); return n; });
+    }
   };
 
   const runBacktest = async () => {
@@ -97,14 +119,29 @@ export default function StrategyPanel() {
     setBtLoading(false);
   };
 
-  // Find metadata for a strategy type
-  const getMeta = (sid: string): StrategyMeta | undefined => {
-    const s = strategies.find(st => st.id === sid);
-    return strategyTypes.find(t => t.name === s?.name || t.id === (s as any)?.strategy_type);
+  // 获取 meta
+  const getMeta = (s: Strategy & { strategy_type?: string }) => {
+    return strategyTypes.find(t => t.id === s.strategy_type || t.name === s.name);
   };
 
+  // 自动消失 toast
+  useEffect(() => {
+    if (toast) {
+      const t = setTimeout(() => setToast(null), 3000);
+      return () => clearTimeout(t);
+    }
+  }, [toast]);
+
   return (
-    <div className="space-y-3">
+    <div className="space-y-3 relative">
+      {/* Toast */}
+      {toast && (
+        <div className={`absolute top-0 left-0 right-0 z-50 px-3 py-1.5 rounded text-[11px] font-medium ${
+          toast.ok ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'
+        }`}>
+          {toast.msg}
+        </div>
+      )}
       {/* Strategy List */}
       <div>
         <div className="flex items-center justify-between mb-2">
@@ -182,6 +219,8 @@ export default function StrategyPanel() {
         {strategies.map((s) => {
           const running = (s as any).running;
           const liveState = (s as any).live_state;
+          const meta = getMeta(s as any);
+          const isLoading = loadingOps.has(s.id);
           return (
             <div key={s.id} className={`rounded-lg border mb-2 overflow-hidden transition ${
               running ? 'border-green-500/30 bg-gray-900/60' : 'border-gray-800 bg-gray-900/30'
@@ -192,20 +231,30 @@ export default function StrategyPanel() {
                     {running && <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />}
                     <p className="text-sm font-medium truncate">{s.name}</p>
                     <span className={`text-[9px] px-1 py-0.5 rounded ${
-                      (s as any).strategy_type === 'futures' || running ? 'bg-yellow-500/20 text-yellow-400' : 'bg-blue-500/20 text-blue-400'
+                      liveState?.market_type === 'futures' ? 'bg-orange-500/20 text-orange-400' : 'bg-blue-500/20 text-blue-400'
                     }`}>
-                      {(s as any).live_state?.market_type || 'spot'}
+                      {liveState?.market_type || 'spot'}
                     </span>
                   </div>
                   <p className="text-[10px] text-gray-500 truncate">{s.symbol} · {s.timeframe}</p>
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
-                  {!running ? (
-                    <button onClick={() => startStrategy(s.id)} className="p-1 hover:bg-gray-800 rounded" title="启动">
+                  {isLoading ? (
+                    <Loader2 className="h-3.5 w-3.5 text-gray-400 animate-spin" />
+                  ) : !running ? (
+                    <button
+                      onClick={() => startStrategy(s.id, liveState?.market_type)}
+                      className="p-1 hover:bg-gray-800 rounded"
+                      title="启动"
+                    >
                       <Play className="h-3.5 w-3.5 text-green-400" />
                     </button>
                   ) : (
-                    <button onClick={() => stopStrategy(s.id)} className="p-1 hover:bg-gray-800 rounded" title="停止">
+                    <button
+                      onClick={() => stopStrategy(s.id)}
+                      className="p-1 hover:bg-gray-800 rounded"
+                      title="停止"
+                    >
                       <Square className="h-3.5 w-3.5 text-red-400" />
                     </button>
                   )}
@@ -217,6 +266,13 @@ export default function StrategyPanel() {
                   <span>📊 {liveState.position?.active ? `${liveState.position.side} @ $${liveState.position.entry_price}` : '空仓'}</span>
                 </div>
               )}
+
+              {/* 参数编辑器 */}
+              <StrategyParamsEditor
+                strategy={s as any}
+                meta={meta}
+                onUpdated={fetchStrategies}
+              />
             </div>
           );
         })}

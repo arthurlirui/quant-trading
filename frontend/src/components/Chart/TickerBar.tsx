@@ -1,47 +1,51 @@
 import { useEffect, useState } from 'react';
 import { TrendingUp, TrendingDown } from 'lucide-react';
-import type { Ticker } from '../../types';
+import type { Ticker, MarketType } from '../../types';
+import { api } from '../../lib/api';
 
-const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT'];
+interface Props {
+  market: MarketType;
+  symbols?: string[];
+}
 
-export default function TickerBar() {
+const DEFAULT_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'];
+
+export default function TickerBar({ market, symbols = DEFAULT_SYMBOLS }: Props) {
   const [tickers, setTickers] = useState<Record<string, Ticker>>({});
 
   useEffect(() => {
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${protocol}//${location.host}/api/v1/ws/market/BTCUSDT`);
+    setTickers({});  // clear when market changes
+    let alive = true;
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'ticker') {
-          setTickers((prev) => ({ ...prev, [msg.data.symbol]: msg.data }));
-        }
-      } catch { /* */ }
-    };
-
-    // Poll REST for tickers
-    const interval = setInterval(async () => {
-      for (const sym of SYMBOLS) {
-        try {
-          const res = await fetch(`/api/v1/market/ticker/${sym}`);
-          const data = await res.json();
-          if (data.price) setTickers((prev) => ({ ...prev, [sym]: data }));
-        } catch { /* */ }
+    const tick = async () => {
+      const results = await Promise.allSettled(
+        symbols.map(sym => api.getTicker(sym, market).then(t => ({ sym, t }))),
+      );
+      if (!alive) return;
+      const next: Record<string, Ticker> = {};
+      for (const r of results) {
+        if (r.status === 'fulfilled' && r.value.t) next[r.value.sym] = r.value.t;
       }
-    }, 5000);
-
-    return () => {
-      ws.close();
-      clearInterval(interval);
+      setTickers(next);
     };
-  }, []);
+
+    tick();
+    const id = setInterval(tick, 4000);
+    return () => { alive = false; clearInterval(id); };
+  }, [market, symbols.join(',')]);
 
   return (
     <div className="flex items-center gap-4 px-4 py-1.5 bg-gray-900/80 border-b border-gray-800 text-xs overflow-x-auto">
-      {SYMBOLS.map((sym) => {
+      <span className={`text-[10px] uppercase font-semibold tracking-wider shrink-0 ${
+        market === 'spot' ? 'text-blue-400' : 'text-orange-400'
+      }`}>
+        {market === 'spot' ? '现货' : '合约'} ·
+      </span>
+      {symbols.map((sym) => {
         const t = tickers[sym];
-        if (!t) return <span key={sym} className="text-gray-500">{sym}...</span>;
+        if (!t) {
+          return <span key={sym} className="text-gray-600">{sym.replace('USDT','')}…</span>;
+        }
         const isUp = t.change >= 0;
         return (
           <div key={sym} className="flex items-center gap-2 shrink-0">
