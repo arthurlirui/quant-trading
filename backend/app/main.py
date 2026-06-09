@@ -28,8 +28,12 @@ from app.core.strategies import (
     MACDComboStrategy,
 )
 from app.core.trading import executor, risk_manager
+from app.core.paper import PaperAccountManager, paper_events
 
 logger = logging.getLogger(__name__)
+
+# Paper manager (initialized in lifespan)
+paper_manager: PaperAccountManager | None = None
 
 # ── Global state ──
 _active_strategies: dict[str, BaseStrategy] = {}     # db_id -> strategy instance
@@ -42,14 +46,29 @@ _connector_symbols: set[str] = set()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global paper_manager
     logger.info("Quant Trading System v0.2.0 starting...")
     await create_tables()
     await executor.start()
     # 启动行情 connector 默认订阅, REST sessions 始终可用
     await connector.start([settings.default_symbol])
     _connector_symbols.add(settings.default_symbol.upper())
+    # Paper trading manager
+    paper_manager = PaperAccountManager(async_session_factory, connector)
+    await paper_manager.start()
+    # Forward paper events to WS clients
+    def _on_paper_event(kind: str, payload: dict):
+        msg = json.dumps({"type": f"paper_{kind}", "data": payload})
+        for ws in list(_ws_clients):
+            try:
+                asyncio.create_task(ws.send_text(msg))
+            except Exception:
+                pass
+    paper_events.on(_on_paper_event)
     logger.info("System ready.")
     yield
+    if paper_manager:
+        await paper_manager.stop()
     await connector.stop()
     await executor.stop()
     for s in _active_strategies.values():
@@ -104,11 +123,53 @@ async def on_kline(data: dict):
                         except Exception:
                             pass
 
-                    # Execute signal via trading executor
+                    # Execute signal via trading executor OR paper manager
                     if signal.action in ("buy", "sell", "close_long", "close_short"):
                         pos = strategy.position
                         mrkt = strategy._market_type
                         lvg = strategy.params.get("futures_leverage", 1)
+
+                        # Determine routing mode: paper if strategy.mode=='paper' and account bound
+                        strategy_mode = getattr(strategy, "_mode", "live")
+                        paper_acc_id = getattr(strategy, "_paper_account_id", None)
+
+                        if strategy_mode == "paper" and paper_acc_id and paper_manager:
+                            # Paper route
+                            paper_result = await paper_manager.execute_signal(
+                                account_id=paper_acc_id,
+                                strategy_id=db_id,
+                                signal_action=signal.action,
+                                symbol=symbol,
+                                price=signal.price,
+                                quantity_pct=signal.quantity_pct or 0.5,
+                                signal_strength=getattr(signal, "strength", None),
+                            )
+                            if paper_result.success and paper_result.trade:
+                                t = paper_result.trade
+                                if paper_result.position_after:
+                                    strategy.update_position(
+                                        signal.action, t.price, data.get("open_time", 0),
+                                        t.quantity, pnl=t.pnl or 0.0,
+                                    )
+                                else:
+                                    strategy.update_position(
+                                        signal.action, t.price, data.get("open_time", 0),
+                                        0.0, pnl=paper_result.realized_pnl_delta,
+                                    )
+                                _save_trade_to_db(
+                                    strategy_id=db_id, symbol=symbol, side=t.side,
+                                    price=t.price, quantity=t.quantity, pnl=t.pnl,
+                                    signal_strength=getattr(signal, "strength", None),
+                                    action=signal.action, mode="paper",
+                                )
+                                logger.info("[Paper] %s %s @ %.2f ✅ (acc=%s)",
+                                            symbol, signal.action, t.price, paper_acc_id[:8])
+                            elif not paper_result.success:
+                                logger.warning("[Paper] %s %s ❌ %s",
+                                               symbol, signal.action, paper_result.error)
+                            continue  # skip live executor branch
+
+                        # Live route (default)
                         result = await executor.execute_signal(
                             signal_action=signal.action,
                             symbol=symbol,
@@ -387,7 +448,16 @@ async def start_strategy(sid: str, data: dict | None = None):
             raise HTTPException(404, "Strategy not found")
 
     market_type = (data or {}).get("market_type", "spot")
+    mode = (data or {}).get("mode", getattr(s, "mode", None) or "live")
+    paper_account_id = (data or {}).get("paper_account_id", getattr(s, "paper_account_id", None))
     strategy_type = getattr(s, "strategy_type", "volume_surge")
+
+    # Validate paper mode
+    if mode == "paper":
+        if not paper_account_id:
+            raise HTTPException(400, "mode=paper requires paper_account_id")
+        if not paper_manager or not (await paper_manager.get_account(paper_account_id)):
+            raise HTTPException(404, f"paper account {paper_account_id} not found")
 
     # Parse params from DB
     params = {}
@@ -402,6 +472,10 @@ async def start_strategy(sid: str, data: dict | None = None):
     if not strategy:
         raise HTTPException(400, f"Failed to create strategy of type '{strategy_type}'")
 
+    # Attach mode info
+    strategy._mode = mode  # type: ignore[attr-defined]
+    strategy._paper_account_id = paper_account_id  # type: ignore[attr-defined]
+
     _active_strategies[sid] = strategy
     if s.symbol not in _active_symbol_map:
         _active_symbol_map[s.symbol] = set()
@@ -411,11 +485,15 @@ async def start_strategy(sid: str, data: dict | None = None):
     await _ensure_symbols([s.symbol])
 
     s.status = "running"
+    s.mode = mode
+    s.paper_account_id = paper_account_id
     async with async_session_factory() as db:
         await db.merge(s)
         await db.commit()
 
-    return {"ok": True, "symbol": s.symbol, "strategy_id": sid, "strategy_type": strategy_type, "market_type": market_type}
+    return {"ok": True, "symbol": s.symbol, "strategy_id": sid,
+            "strategy_type": strategy_type, "market_type": market_type,
+            "mode": mode, "paper_account_id": paper_account_id}
 
 
 @app.post("/api/v1/strategies/{sid}/stop")
@@ -895,3 +973,122 @@ async def ws_signals(ws: WebSocket):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "quant-trading", "version": "0.2.0"}
+
+
+
+# ── Paper Trading ──────────────────────────────────────────────────
+
+@app.post("/api/v1/paper/accounts")
+async def create_paper_account(data: dict):
+    """Create a new paper trading account."""
+    if not paper_manager:
+        raise HTTPException(503, "paper trading not initialized")
+    account = await paper_manager.create_account(
+        name=data.get("name", "Paper Account"),
+        initial_capital=data.get("initial_capital", settings.paper_default_capital),
+        fee_rate=data.get("fee_rate", settings.paper_default_fee_rate),
+        slippage_bps=data.get("slippage_bps", settings.paper_default_slippage_bps),
+    )
+    return account.to_dict({})
+
+
+@app.get("/api/v1/paper/accounts")
+async def list_paper_accounts():
+    """List all paper trading accounts."""
+    if not paper_manager:
+        return []
+    accounts = await paper_manager.list_accounts()
+    all_symbols = set()
+    for acc in paper_manager._accounts.values():
+        all_symbols.update(acc.positions.keys())
+    mark_prices = await paper_manager._get_mark_prices(list(all_symbols))
+    return [a.to_dict(mark_prices) for a in accounts]
+
+
+@app.get("/api/v1/paper/accounts/{account_id}")
+async def get_paper_account(account_id: str):
+    """Get paper account detail (with equity & PnL)."""
+    if not paper_manager:
+        raise HTTPException(503, "paper trading not initialized")
+    account = await paper_manager.get_account(account_id)
+    if not account:
+        raise HTTPException(404, "account not found")
+    mark_prices = await paper_manager._get_mark_prices(list(account.positions.keys()))
+    return account.to_dict(mark_prices)
+
+
+@app.delete("/api/v1/paper/accounts/{account_id}")
+async def delete_paper_account(account_id: str):
+    if not paper_manager:
+        raise HTTPException(503, "paper trading not initialized")
+    ok = await paper_manager.delete_account(account_id)
+    if not ok:
+        raise HTTPException(404, "account not found")
+    return {"ok": True}
+
+
+@app.post("/api/v1/paper/accounts/{account_id}/reset")
+async def reset_paper_account(account_id: str, data: dict | None = None):
+    if not paper_manager:
+        raise HTTPException(503, "paper trading not initialized")
+    capital = data.get("initial_capital") if data else None
+    account = await paper_manager.reset_account(account_id, capital)
+    if not account:
+        raise HTTPException(404, "account not found")
+    return account.to_dict({})
+
+
+@app.get("/api/v1/paper/accounts/{account_id}/trades")
+async def get_paper_trades(account_id: str, limit: int = Query(50, ge=1, le=500)):
+    if not paper_manager:
+        return []
+    return await paper_manager.get_trades(account_id, limit)
+
+
+@app.get("/api/v1/paper/accounts/{account_id}/positions")
+async def get_paper_positions(account_id: str):
+    if not paper_manager:
+        return []
+    return await paper_manager.get_positions(account_id)
+
+
+@app.get("/api/v1/paper/accounts/{account_id}/equity")
+async def get_paper_equity(account_id: str, limit: int = Query(5000, ge=1, le=100000)):
+    if not paper_manager:
+        return []
+    return await paper_manager.get_equity_snapshots(account_id, limit)
+
+
+@app.get("/api/v1/paper/accounts/{account_id}/metrics")
+async def get_paper_metrics(account_id: str):
+    if not paper_manager:
+        return {}
+    return await paper_manager.get_metrics(account_id)
+
+
+@app.post("/api/v1/strategies/{sid}/bind-paper-account")
+async def bind_paper_account(sid: str, data: dict):
+    """Bind a strategy to a paper trading account."""
+    paper_account_id = data.get("paper_account_id")
+    if not paper_account_id:
+        raise HTTPException(400, "paper_account_id required")
+    if not paper_manager:
+        raise HTTPException(503, "paper trading not initialized")
+    account = await paper_manager.get_account(paper_account_id)
+    if not account:
+        raise HTTPException(404, f"paper account {paper_account_id} not found")
+
+    async with async_session_factory() as db:
+        result = await db.execute(select(StrategyModel).where(StrategyModel.id == sid))
+        s = result.scalar_one_or_none()
+        if not s:
+            raise HTTPException(404, "Strategy not found")
+        s.mode = "paper"
+        s.paper_account_id = paper_account_id
+        await db.commit()
+
+    if sid in _active_strategies:
+        _active_strategies[sid]._mode = "paper"  # type: ignore[attr-defined]
+        _active_strategies[sid]._paper_account_id = paper_account_id  # type: ignore[attr-defined]
+
+    return {"ok": True, "strategy_id": sid, "mode": "paper", "paper_account_id": paper_account_id}
