@@ -44,5 +44,11 @@ class Settings(BaseSettings):
     default_stop_loss_pct: float = 2.0
     default_take_profit_pct: float = 5.0
 
+    # Paper trading
+    paper_default_capital: float = 10000.0
+    paper_default_fee_rate: float = 0.001
+    paper_default_slippage_bps: float = 5.0
+    paper_equity_snapshot_interval: int = 60
+
 
 settings = Settings()

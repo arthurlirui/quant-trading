@@ -19,6 +19,9 @@ class Strategy(Base):
     timeframe: Mapped[str] = mapped_column(String(5), default="1m")
     params: Mapped[str] = mapped_column(Text, default="{}", comment="JSON config")
     status: Mapped[str] = mapped_column(String(20), default="stopped")
+    strategy_type: Mapped[str] = mapped_column(String(50), default="volume_surge")
+    mode: Mapped[str] = mapped_column(String(10), default="live")        # live | paper
+    paper_account_id: Mapped[str | None] = mapped_column(String(36), nullable=True, default=None)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
