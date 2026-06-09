@@ -162,6 +162,8 @@ class PaperMatcher:
 
         if not account.can_afford(notional):
             return PaperExecutionResult(False, error="insufficient funds")
+        if notional <= 0 or fill_price <= 0:
+            return PaperExecutionResult(False, error="invalid order size")
 
         qty = notional / fill_price
         fee = round(notional * account.fee_rate, 4)
